@@ -1,0 +1,284 @@
+---
+title: "Single-Cell RNA-Seq Transcriptomics project"
+output: html_notebook
+author: Emanuele Cavalleri 
+---
+
+This is the R vignette of a Single-Cell RNA-Seq Transcriptomics project. In this vignette we will start from a count table, with counts from project SRS3044261. Data can be retrieved from https://panglaodb.se/view_data.php?sra=SRA653146&srs=SRS3044261.
+
+The analysis is performed on a dataset of lung cells (protocol: 10x chromium). Single cells were sequenced on the Illumina NovaSeq 6000. 
+
+# Setup the Seurat Object
+
+```{r}
+library(Seurat)
+library(dplyr)
+#devtools::install_github("thomasp85/patchwork")
+library(patchwork)
+library(ggplot2)
+```
+
+Let's load the count table.
+```{r}
+exp.mat <- read.table(file = "SRA653146_SRS3044261.mat", header = TRUE, as.is = TRUE, row.names = 1)
+```
+
+The row names of the table are the "annoying" x_ENSMUSG IDs with the number at the end. Let’s clean them. 
+```{r}
+ensembl <- gsub("\\_E.*", "", rownames(exp.mat))
+ensembl <- make.names(ensembl, unique=TRUE)
+rownames(exp.mat) <- ensembl
+```
+
+We create our Seurat object and complete the initialization steps.
+```{r}
+lung <- CreateSeuratObject(counts = exp.mat, project = "lungmm", min.cells = 3, min.features = 200)				
+lung
+```
+
+min.cells is the minimum number of cells in which a gene can be detected; min.features is the minimum number of genes that have to be expressed in a cell: genes/cells not satisfying these constraints are discarded a priori. In all the table will contain 2,977 cells and 20,730 "active" genes ("features") after filtering. 
+
+# QC and selecting cells for further analysis
+
+The first step is the quality control on cells. We use the set of all genes with name starting with "mt" to identify mitochondrial genes (data are from mouse).
+```{r}
+unlist(rownames(exp.mat), use.names = FALSE)[grep("^mt", unlist(rownames(exp.mat), use.names = FALSE))] 
+```
+
+Percentage of counts originating from a set of genes:
+```{r}
+lung[["percent.mt"]] <- PercentageFeatureSet(lung, pattern = "^mt")
+head(lung@meta.data, 5)
+```
+
+Let's visualize QC metrics, and use these to filter cells.
+```{r}
+VlnPlot(lung, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+```
+
+FeatureScatters:
+```{r}
+plot1 <- FeatureScatter(lung, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(lung, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+```
+
+We filter cells that have the number of expressed genes over 4,500 (doublets) or less than 200 (low quality cells/empty droplets), and we filter cells that have > 10% mitochondrial counts (low quality cells).
+```{r}
+lung <- subset(lung, subset = nFeature_RNA > 200 & nFeature_RNA < 4500 & percent.mt < 10)
+```
+
+# Normalizing the data
+
+After removing unwanted cells from the dataset, the next step is to normalize the data.
+```{r}
+lung <- NormalizeData(lung) #default parameters: normalization.method = "LogNormalize", scale.factor = 10000
+```
+
+# Identification of highly variable features (feature selection)
+
+The next step is to restrict the gene set to the "most variable" genes: those genes that exhibit the highest cell-to-cell variation in the dataset. By default the top 2000 variable genes are kept for all downstream analyses. Changing this number clearly will change the final results.
+```{r}
+lung <- FindVariableFeatures(lung, selection.method = "vst", nfeatures = 2000)
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(lung), 10)
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(lung)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1+plot2
+```
+
+Top 10 most variable genes:
+```{r}
+top10
+```
+
+# Scaling the data
+
+All log-normalized counts are transformed so that they have mean 0 and variance 1 across all cells, regardless of the count values (high or low). This in practice correspond to a "binarization" of the data, or rather "ternarization", where in general for each cell a gene will be tend "up" (>0), "average" (=0) or "down" (<0) with very close values. 
+```{r}
+all.genes <- rownames(lung)
+lung <- ScaleData(lung, features = all.genes)
+```
+
+The list of S and G2M specific genes are already pre-loaded in Seurat, in "cc.genes". We can segregate this list into markers of G2/M phase and markers of S phase.
+```{r}
+s.genes <- stringr::str_to_title(cc.genes$s.genes) # stringr::str_to_title(): fro ex. from "PCNA" to "Pcna" since we are working on Mm genes
+g2m.genes <- stringr::str_to_title(cc.genes$g2m.genes)
+lung <- CellCycleScoring(lung, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+```
+
+View cell cycle scores and phase assignments.
+```{r}
+head(lung[[]])
+```
+Running a PCA on cell cycle genes reveals that cells do not separate entirely by phase -> no need to regress them out.
+```{r}
+lung <- RunPCA(lung, features = c(s.genes, g2m.genes))
+DimPlot(lung)
+```
+
+# Perform linear dimensional reduction
+
+The next step is the dimensionality reduction, on scaled counts and on the 2000 most variable genes extracted before, with PCA.
+```{r}
+lung <- RunPCA(lung, features = VariableFeatures(object = lung))
+print(lung[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(lung, dims = 1:2, reduction = "pca")
+```
+
+We visualize the results on the first two PC.
+```{r}
+DimPlot(lung, reduction = "pca")
+```
+
+We can plot the data projected on any of the PCA dimensions.
+```{r}
+DimPlot(lung, reduction = "pca", dims = c(3,4))
+```
+
+Heatmap of the most variable genes on the most variable cells in the first PC:
+```{r}
+DimHeatmap(lung, dims = 1, cells = 500, balanced = TRUE)
+```
+
+There are several genes with a clear difference of expression across the most variable cells, splitting them into two main groups. The same can be done for the other PCs.
+```{r}
+DimHeatmap(lung, dims = 1:9, cells = 500, balanced = TRUE)
+```
+
+# Determine the "dimensionality" of the dataset
+
+Next step is to determine the "dimensionality" of the dataset. "Significant" PCs in JackStrawPlot() will show a strong enrichment of features with low p-values (solid curve above the dashed line). 
+```{r}
+lung <- JackStraw(lung, num.replicate = 100)
+lung <- ScoreJackStraw(lung, dims = 1:20)
+```
+```{r}
+JackStrawPlot(lung, dims = 1:20)
+```
+
+An alternative heuristic method generates an "Elbow plot". Here we can observe an "elbow" around PC20, suggesting that the majority of true signal is captured in the first 20 PCs.
+```{r}
+ElbowPlot(lung)
+```
+
+# Cluster the cells
+
+Setting resolution between 0.4-1.2 typically returns good results for single-cell datasets of around 3K cells. Optimal resolution often increases for larger datasets. The clusters can be found using the Idents function.
+```{r}
+lung <- FindNeighbors(lung, dims = 1:20)
+lung <- FindClusters(lung, resolution = 0.5)
+head(Idents(lung), 5)
+```
+
+Now the PCA plot is labeled with clusters.
+```{r}
+DimPlot(lung, reduction = "pca")
+```
+
+# Run non-linear dimensional reduction 
+
+UMAP:
+```{r}
+#reticulate::py_install(packages ='umap-learn')
+lung <- RunUMAP(lung, dims = 1:20)
+DimPlot(lung, reduction = "umap")
+```
+
+We visualize here a table containing (identified by number) the number of cells belonging to each cluster, useful to be compared to the "cluster table" on PanglaoDB (https://panglaodb.se/list_clusters_and_cell_types.html?sra=SRA653146&srs=SRS3044261).
+```{r}
+table(Idents(lung))
+```
+
+Let's save the object.
+```{r}
+saveRDS(lung, file = "lung.rds")
+```
+
+# Finding differentially expressed features (cluster biomarkers)
+
+The final step is to give an "identity" to the clusters. That is, find which are the "marker genes" (expressed exclusively, or at least over-expressed) in each cluster with respect to the others. Then, trying to figure out, according to the marker genes of each cluster, what could be the corresponding cell type.
+
+We can find the "differentially expressed genes" for a cluster against the others, with the additional condition that the gene has to be expressed in at least the 25% of the cells in the cluster:
+```{r}
+cluster1.markers <- FindMarkers(lung, ident.1 = 1, min.pct = 0.25)
+```
+```{r}
+head(cluster1.markers, n = 5)
+```
+
+Or choose to compare explicitly two or more clusters. Here cluster 5 is compared to clusters 0 and 3.
+```{r}
+cluster5.markers <- FindMarkers(lung, ident.1 = 5, ident.2 = c(0, 3), min.pct = 0.25)
+```
+```{r}
+head(cluster5.markers, n = 5)
+```
+
+Or, find the markers of all clusters, with respect to the others (this will take longer). The results are stored in a table with two genes for each cluster. Here the criteria are a) expressed in at least 25% of the cells and b) with a log2 fold change of at least 0.25.
+```{r}
+lung.markers <- FindAllMarkers(lung, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+```
+```{r}
+lung.markers %>% group_by(cluster) %>% top_n(n = 2, wt = avg_log2FC)
+```
+
+
+There are several tools for visualizing marker expression. VlnPlot() (shows expression probability distributions across clusters), and FeaturePlot() are most commonly used visualizations. There are also RidgePlot() and DotPlot() as additional methods to view our dataset.
+```{r}
+# Violin plot of the expression of the best "marker gene" for each cluster:
+# VlnPlot(lung, features = features = c("Slc7a10", "Gzma", "Rbp1", "Pi16", "Vcam1", "Mustn1", "Cox4i2", "Ear2", "Ms4a6c", "Igkc", "Sftpa1", "Ak7", "Aqp1", "Rac2")) splitted into (for better visualization):
+VlnPlot(lung, features = c("Slc7a10", "Gzma", "Rbp1"))
+VlnPlot(lung, features = c("Pi16", "Vcam1", "Mustn1"))
+VlnPlot(lung, features = c("Cox4i2", "Ear2", "Ms4a6c")) 
+VlnPlot(lung, features = c("Igkc", "Sftpa1", "Ak7")) 
+VlnPlot(lung, features = "Aqp1") 
+VlnPlot(lung, features = "Rac2") # Unknown
+#FeaturePlot(lung, features = c("Slc7a10", "Gata3", "Gzma", "Ccl5", "Ifng", "Rbp1", "Pi16", "Vcam1", "Mustn1", "Acta2", "Cox4i2", "Higd1b", "Chil3", "Ear1", "Ear2", "Ms4a6c", "Ccr7", "Igkc", "Sftpa1", "Sftpc", "Sfta2", "Egfl6", "Lamp3", "Ak7", "Aqp1", "Bcam", "Rac2", "Atf3")) splitted into (for better visualization):
+FeaturePlot(lung, features = c("Slc7a10", "Gata3", "Gzma", "Ccl5"))
+FeaturePlot(lung, features = c("Ifng", "Rbp1", "Pi16", "Vcam1"))
+FeaturePlot(lung, features = c("Mustn1", "Acta2", "Cox4i2", "Higd1b"))
+FeaturePlot(lung, features = c("Chil3", "Ear1", "Ear2", "Ms4a6c"))
+FeaturePlot(lung, features = c("Ccr7", "Igkc", "Sftpa1", "Sftpc"))
+FeaturePlot(lung, features = c("Sfta2", "Egfl6", "Lamp3", "Ak7"))
+FeaturePlot(lung, features = c("Aqp1", "Bcam", "Rac2", "Atf3"))
+RidgePlot(lung, features = c("Gzma", "Ear2"), ncol = 2) # Ridge plots from ggridges. Visualize single cell expression distributions in each cluster
+DotPlot(lung, features = c("Slc7a10", "Gata3", "Gzma", "Ccl5", "Ifng", "Rbp1", "Pi16", "Vcam1", "Mustn1", "Acta2", "Cox4i2", "Higd1b", "Chil3", "Ear1", "Ear2", "Ms4a6c", "Ccr7", "Igkc", "Sftpa1", "Sftpc", "Sfta2", "Egfl6", "Lamp3", "Ak7", "Aqp1", "Bcam", "Rac2", "Atf3", "Irf8")) + RotatedAxis() # the size of the dot corresponds to the percentage of cells expressing the feature in each cluster. The color represents the average expression level
+```
+
+DoHeatmap() generates an expression heatmap for given cells and features. In this case, we are plotting the top 10 markers for each cluster.
+```{r}
+lung.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) -> top10
+DoHeatmap(lung, features = top10$gene) + NoLegend()
+```
+
+# Assigning cell type identity to clusters
+
+```{r}
+new.cluster.ids <- c("Fibroblasts", "NK", "Fibroblasts", "Fibroblasts", "Fibroblasts", "SMCs", "Pericytes", "Alveolar m.", "Macrophages", "B", "PneumocytesII", "Ependymal", "Endothelial", "Unknown")
+names(new.cluster.ids) <- levels(lung)
+lung <- RenameIdents(lung, new.cluster.ids)
+DimPlot(lung, reduction = "umap", label = TRUE, pt.size = 0.5) + NoLegend()
+saveRDS(lung, file = "lung_final.rds")
+```
+Single cell heatmap showing the expression of best “marker gene” for each cluster overlayed on the UMAP projection of the cells.
+
+```{r}
+DoHeatmap(subset(lung, downsample = 100), features = c("Slc7a10", "Gzma", "Rbp1", "Pi16", "Vcam1", "Mustn1", "Cox4i2", "Ear2", "Ms4a6c", "Igkc", "Sftpa1", "Ak7", "Aqp1", "Rac2"), size = 3)
+```
+
+# sessionInfo()
+
+This analysis was conducted on:
+```{r}
+sessionInfo()
+```
+
+# Bibliography
+
+Hao, Hao, et al., Cell 2021; Seurat V4; https://satijalab.org/seurat/
+
+Giulio Pavesi; Seurat example on 10x Data (2021 update); http://159.149.160.56/Transcriptomics/seurat.html
